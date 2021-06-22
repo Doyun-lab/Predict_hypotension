@@ -1,3 +1,5 @@
+rm(list = ls())
+
 library(tidyverse)
 library(doParallel)
 library(foreach)
@@ -95,33 +97,41 @@ ibp_data$event <- as.factor(ibp_data$event)
 # ------------------------------------------------------------------------------
 # statistics
 table(ibp_data$event)
+ibp_data[is.na(ibp_data)] <- 0
 normal <- subset(ibp_data, ibp_data$event == 0)
 hypo <- subset(ibp_data, ibp_data$event == 1)
 
+total <- ibp_data[,1:15000]
 normal <- normal[,1:15000]
 hypo <- hypo[,1:15000]
 
 # mean
+mean(apply(total, 1, mean))
 mean(apply(normal, 1, mean))
 mean(apply(hypo, 1, mean))
 
 # min
+mean(apply(total, 1, min))
 mean(apply(normal, 1, min))
 mean(apply(hypo, 1, min))
 
 # max
+mean(apply(total, 1, max))
 mean(apply(normal, 1, max))
 mean(apply(hypo, 1, max))
 
 # sd
+mean(apply(total, 1, sd))
 mean(apply(normal, 1, sd))
 mean(apply(hypo, 1, sd))
 
 # skewness
+mean(apply(total, 1, skewness))
 mean(apply(normal, 1, skewness))
 mean(apply(hypo, 1, skewness))
 
 # kurtosis
+mean(apply(total, 1, kurtosis))
 mean(apply(normal, 1, kurtosis))
 mean(apply(hypo, 1, kurtosis))
 
@@ -145,6 +155,9 @@ skewness <- function(x){
 # rrs 함수 만들기
 rrs <- function(x) rms(x)*(length(x))^0.5
 
+harmonic_mean <- function(x){
+  1/mean(1/x)
+}
 # ------------------------------------------------------------------------------
 # 특징 추출
 smry_rslt <- data.frame()
@@ -171,7 +184,6 @@ for(sub in ibp_ext){
                                            p_std=ifelse(!is.null(p), ifelse(is.null(std(p[,1])), 0, std(p[,1])), 0)))
 }
 
-Peak_rslt$event <- as.factor(ibp_data$event)
 Peak_rslt[is.na(Peak_rslt)] <- 0
 
 # ------------------------------------------------------------------------------
@@ -236,8 +248,22 @@ ibp_feature_df <- cbind(smry_rslt, cf_df, fftsmry_df, Peak_rslt)
 ibp_feature_df$cpt_mean <- cpt_mean
 ibp_feature_df$cpt_var <- cpt_var
 ibp_feature_df$cpt_mean_var <- cpt_mean_var 
+ibp_feature_df$event <- as.factor(ibp_data$event)
 #saveRDS(ibp_feature_df, "ibp_modeling_data2.rds")
-load("ibp_modeling_data2.rds")
+#load("ibp_modeling_data2.rds")
+
+# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# PCA
+pcadata <- ibp_feature_df %>% select(-event, -imvalue_fn10)
+pca <- prcomp(pcadata, scale = TRUE)
+
+# PC1에 대해 강한 양의 부하량 : fn10, fn3, fn7 등  / 음의 부하량 : p_std, p_max, p_mean
+# PC2에 대해 강한 양의 부하량 : revalue_fn9, imvalue_fn2 등 / 음의 부하량 : imvaluefn3, fn4 등
+screeplot(pca, main = "", col = "green", type = "lines", pch = 1, npcs = length(pca$sdev))
+biplot(pca)
+
+summary(pca)
 
 # ------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------
@@ -271,7 +297,25 @@ table(train_y_down)
 
 test_x = test %>% select(-event)
 test_y = test$event
+# ------------------------------------------------------------------------------
 
+pca_data2 = pcadata
+pca_data2$event = as.factor(ibp_feature_df$event)
+
+train_pca = pca_data2[inTrain,]
+test_pca = pca_data2[-inTrain,]
+
+train_x_pca = train_pca %>% select(-event)
+train_x_pca <- as.matrix(train_x_pca) %*% pca$rotation
+train_y_pca = train_pca$event
+
+test_x_pca = test_pca %>% select(-event)
+test_x_pca <- as.matrix(test_x_pca) %*% pca$rotation
+test_y_pca = test_pca$event
+
+train_pca_rf = as.data.frame(train_x_pca)
+train_pca_rf$event <- as.factor(train_y_pca)
+# ------------------------------------------------------------------------------
 confusion_matrix = function(result){
   accuracy <- c()
   precision <- c()
@@ -306,18 +350,22 @@ confusion_matrix = function(result){
 rf.fit_raw = randomForest(event ~ ., data=train, mtry=floor(sqrt(length(train)-1)), ntree=500, importance=T)
 rf.fit_up = randomForest(Class ~ ., data=train_up, mtry=floor(sqrt(length(train_up)-1)), ntree=500, importance=T)
 rf.fit_down = randomForest(Class ~ ., data=train_down, mtry=floor(sqrt(length(train_down)-1)), ntree=500, importance=T)
+rf.fit_pca = randomForest(event ~ PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10 + PC11 + PC12, data=train_pca_rf, mtry=floor(sqrt(length(train_pca_rf)-1)), ntree=500, importance=T)
 
 y_predrf_raw = predict(rf.fit_raw, test_x)
 y_predrf_up = predict(rf.fit_up, test_x)
 y_predrf_down = predict(rf.fit_down, test_x)
+y_predrf_pca = predict(rf.fit_pca, test_x_pca)
 
 conf_rf_raw <- confusionMatrix(y_predrf_raw, test_y)
 conf_rf_up <- confusionMatrix(y_predrf_up, test_y)
 conf_rf_down <- confusionMatrix(y_predrf_down, test_y)
+conf_rf_pca <- confusionMatrix(y_predrf_pca, test_y_pca)
 
 confusion_matrix(conf_rf_raw$table)
 confusion_matrix(conf_rf_up$table)
 confusion_matrix(conf_rf_down$table)
+confusion_matrix(conf_rf_pca$table)
 
 # ------------------------------------------------------------------------------
 # XGBoost
@@ -325,28 +373,35 @@ confusion_matrix(conf_rf_down$table)
 dtrain <- xgb.DMatrix(data = train_x %>% data.matrix(), label= as.numeric(train_y)-1)
 dtrain_up <- xgb.DMatrix(data = train_x_up %>% data.matrix(), label= as.numeric(train_y_up)-1)
 dtrain_down <- xgb.DMatrix(data = train_x_down %>% data.matrix(), label= as.numeric(train_y_down)-1)
+dtrain_pca <- xgb.DMatrix(data = train_x_pca %>% data.matrix(), label= as.numeric(train_y_pca)-1)
 
 dtest <- xgb.DMatrix(data = test_x %>% data.matrix(), label= as.numeric(test_y)-1)
+dtest_pca <- xgb.DMatrix(data = test_x_pca %>% data.matrix(), label= as.numeric(test_y_pca)-1)
 
 xgb_fit_raw = xgboost(data = dtrain, nround = 700, eta=0.05, max_depth=8, objective="binary:logistic")
 xgb_fit_up = xgboost(data = dtrain_up, nround = 700, eta=0.05, max_depth=8, objective="binary:logistic")
 xgb_fit_down = xgboost(data = dtrain_down, nround = 700, eta=0.05, max_depth=8, objective="binary:logistic")
+xgb_fit_pca = xgboost(data = dtrain_pca, nround = 700, eta=0.05, max_depth=8, objective="binary:logistic")
 
 y_predxgb_raw <- predict(xgb_fit_raw, dtest)
 y_predxgb_up <- predict(xgb_fit_up, dtest)
 y_predxgb_down <- predict(xgb_fit_down, dtest)
+y_predxgb_pca <- predict(xgb_fit_pca, dtest_pca)
 
 pred_xgb_raw <- as.numeric(y_predxgb_raw > 0.5)
 pred_xgb_up <- as.numeric(y_predxgb_up > 0.5)
 pred_xgb_down <- as.numeric(y_predxgb_down > 0.5)
+pred_xgb_pca <- as.numeric(y_predxgb_pca > 0.5)
 
 conf_xgb_raw <- confusionMatrix(as.factor(pred_xgb_raw), test_y)
 conf_xgb_up <- confusionMatrix(as.factor(pred_xgb_up), test_y)
 conf_xgb_down <- confusionMatrix(as.factor(pred_xgb_down), test_y)
+conf_xgb_pca <- confusionMatrix(as.factor(pred_xgb_pca), test_y_pca)
 
 confusion_matrix(conf_xgb_raw$table)
 confusion_matrix(conf_xgb_up$table)
 confusion_matrix(conf_xgb_down$table)
+confusion_matrix(conf_xgb_pca$table)
 
 # ------------------------------------------------------------------------------
 # DNN
@@ -380,7 +435,10 @@ model %>%
   layer_dropout(rate = 0.4) %>% 
   layer_dense(units = 128, activation = 'relu') %>%
   layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 64, activation = 'relu') %>%
+  layer_dropout(rate = 0.2) %>%
   layer_dense(units = 2, activation = 'sigmoid')
+
 
 history <- model %>% compile(
   loss = 'binary_crossentropy',
@@ -460,3 +518,14 @@ y_predsvm_raw <- ifelse(y_predsvm_raw == "TRUE", 0, 1)
 conf_svm_raw <- confusionMatrix(as.factor(y_predsvm_raw), test_y_svm)
 
 confusion_matrix(conf_svm_raw$table)
+
+# ------------------------------------------------------------------------------
+# 10-fold 검증
+cv_model = xgb.cv(data = data.matrix(train_x), label = as.numeric(train_y)-1, num_class = levels(train_y) %>% length,
+                  nfold = 10, nrounds = 700, early_stopping_rounds = 150, objective="binary:logistic", verbose = F, prediction = T)
+pred_df = cv_model$pred %>% as.data.frame %>%
+  mutate(pred = levels(train_y)[max.col(.)] %>% as.factor, actual = train_y)
+pred_df %>% select(pred, actual) %>% table
+
+conf_xgbcv = confusionMatrix(pred_df$pred, pred_df$actual)
+confusion_matrix()
